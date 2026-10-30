@@ -256,3 +256,11 @@ npm run icon:build       # 重新生成全套图标
 ./scripts/build-linux.sh
 .\scripts\build-windows.ps1
 ```
+
+---
+
+## 十、许可证
+
+本项目基于 [MIT License](LICENSE) 开源。
+
+Copyright (c) 2026 chai

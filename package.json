@@ -3,6 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
+  "license": "MIT",
   "description": "云效流水线实时监控桌面工具（Tauri v2 + Vue 3 + TypeScript）",
   "scripts": {
     "dev": "vite",
