@@ -2,18 +2,28 @@
 
 基于 **Tauri v2 + Vue 3 + TypeScript + Rust** 的桌面工具，用于实时查看阿里云云效（Alibaba Cloud DevOps）流水线 Flow 的运行状态与构建日志，并支持运行控制。
 
+界面为两栏布局：左侧是流水线树（每条流水线可展开最近 3 次运行），右侧是运行详情（阶段 → 任务拓扑）与实时日志面板。
+
+| 层 | 选型 |
+|---|---|
+| 桌面框架 | [Tauri v2](https://tauri.app/) |
+| 前端 | Vue 3 + TypeScript + Vite |
+| 后端 | Rust（tokio / reqwest / futures） |
+| 接口 | 阿里云云效 OpenAPI（Flow，中心版） |
+| 平台 | Windows 优先（NSIS 安装包），Linux 构建脚本可用 |
+
 ---
 
 ## 一、功能清单
 
 ### 只读监控
-- **流水线总览**：列表分页（云效上限 30 条/页）、按名称搜索、按运行状态筛选（全部 / 运行中 / 成功 / 失败 / 已取消 / 等待中）
+- **流水线总览**：列表分页（云效上限 30 条/页）、按名称搜索、按状态筛选（全部 / 运行中 / 成功 / 失败 / 已取消 / 等待中）
 - **实时状态**：后台轮询线程统一调度，状态变化通过 Tauri 事件推送到前端，前端不各自发请求
-- **运行历史**：单次流水线的历史实例分页、按状态筛选、显示触发方式 / 分支 / 耗时
-- **运行详情**：阶段（Stage）→ 任务（Job）拓扑，逐节点状态、起止时间、耗时；运行中实例每 5 秒自动刷新详情
-- **实时日志**：任务步骤（Step）下拉切换、增量拉取（`offset/last/more`）、2 秒自动追加、自动跟随尾部（手动上翻自动暂停跟随，滚回底部恢复）
-- **ANSI 渲染**：完整解析 SGR 颜色码（基本色 / 亮色 / 256 色 / 真彩 / 粗体 / 下划线等），错误行与告警行高亮
-- **日志操作**：关键词过滤、行号、折行开关、复制纯文本、下载 `.log` 文件、获取官方日志下载地址
+- **运行历史（内嵌）**：作为流水线的子项展示，默认折叠；展开后只列最近 3 次运行（状态、触发方式、耗时），点击流水线本身则直接展示它最近一次运行的详情
+- **运行详情**：阶段（Stage）→ 任务（Job）拓扑，逐节点状态、起止时间、耗时；运行中实例每 5 秒自动刷新
+- **实时日志**：按步骤增量拉取，任务运行中每 2 秒追加；可自动跟随正在执行的步骤（步骤 1 结束后自动切到步骤 2）；手动上翻会暂停「跟随尾部」，滚回底部自动恢复
+- **日志渲染**：完整解析 ANSI SGR 颜色码（基本色 / 亮色 / 256 色 / 真彩 / 粗体 / 下划线等），并按级别（ERROR / WARN / INFO / DEBUG / SUCCESS）分级配色
+- **日志操作**：关键词过滤、行号、折行（默认开启）、平滑滚动跟随、复制纯文本、下载 `.log` 文件、获取官方日志下载地址
 - **内存保护**：单步骤日志最多保留 20000 行，超出丢弃头部
 
 ### 运行控制（写操作）
@@ -25,12 +35,15 @@
 | 终止任务 | `StopPipelineJobRun` |
 | 跳过任务 | `SkipPipelineJobRun` |
 
+> 运行流水线的入口在右侧详情区头部；该流水线还没有运行记录时，空状态里也会提供「运行流水线」按钮。
+
 ### 桌面集成
 - **系统托盘常驻**：托盘提示实时显示「运行中 / 成功 / 失败」计数；左键单击唤出主窗口
 - **托盘菜单**：显示主界面 / 立即刷新 / 开始·暂停轮询 / 退出
 - **关闭即最小化**：点窗口关闭按钮默认收进托盘继续监控（可在设置中改为直接退出）
 - **桌面通知**：流水线状态跃迁（运行中 → 成功 / 失败 / 取消）时弹系统通知，可分别开关
 - **轮询自适应**：无运行中实例时用常规间隔（默认 10s），一旦有实例在跑自动切到加速间隔（默认 3s）
+- **开机自启**：设置面板一键开关。Windows 下写入当前用户的 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`，无需管理员权限；Linux/macOS 走对应平台的登录启动项
 
 ---
 
@@ -71,58 +84,68 @@ https://{domain}/oapi/v1/flow/organizations/{organizationId}/...
 
 只想纯监控的话，后两项给「只读」即可，写操作按钮会返回 403 并给出提示。
 
+### 返回结构兼容说明
+
+官方文档与实际返回存在差异，代码里按真实响应做了兼容（见 `src-tauri/src/api/models.rs`）：
+
+- **GetPipelineJobSteps**：实际返回的是**数组**（一次构建过程一个元素），步骤在 `buildProcessNodes` 里，而文档写的是对象 + `steps`。元素中的 `jobId` 实际等于 `buildId`，因此运行任务 ID 仍使用请求参数。两种形态都已兼容。
+- **GetPipelineJobStepLog**：`offset` 的单位是**行号**而不是字符偏移，`limit` 是本次最多返回的**行数**；`last` 表示下一行的位置，`-1` 表示没有更多。步骤尚未产出日志时接口会返回一段 `[ERROR] Log real-time query exception ...` 占位文本，前端会把它过滤掉。
+- **GetPipelineJobStepLogUrl**：直接返回**纯文本 URL**（Content-Type 却是 `application/json`），客户端已做纯文本兜底。
+- **GetPipelineRun**：`sources[].data.commit` 是一段 JSON 数组文本，提交信息经过百分号编码；解析时会取出 `commitId` 并解码 `commitMsg`。
+
 ---
 
 ## 三、目录结构
 
 ```
 yunxiao-flow-monitor/
-├── package.json                  前端依赖与脚本
+├── LICENSE                        MIT 许可证
+├── .gitattributes                 统一换行符（仓库内 LF）
+├── package.json                   前端依赖与脚本
 ├── vite.config.ts
 ├── tsconfig.json
 ├── index.html
 ├── env.d.ts
 ├── scripts/
-│   ├── gen-icon.mjs              零依赖生成 1024×1024 图标源 PNG（手写 PNG 编码器）
-│   ├── build-linux.sh            Linux 编译脚本
-│   └── build-windows.ps1         Windows 编译脚本
-├── src/                          Vue 3 前端
+│   ├── gen-icon.mjs               零依赖生成 1024×1024 图标源 PNG（手写 PNG 编码器）
+│   ├── build-linux.sh             Linux 编译脚本
+│   └── build-windows.ps1          Windows 编译脚本
+├── src/                           Vue 3 前端
 │   ├── main.ts
-│   ├── App.vue                   顶栏 / 三栏布局 / 通知 / 设置入口
-│   ├── store.ts                  全局单一状态源 + 所有业务动作
-│   ├── types.ts                  与 Rust DTO 对齐的类型定义
+│   ├── App.vue                    顶栏 / 两栏布局 / 通知 / 设置入口
+│   ├── store.ts                   全局单一状态源 + 所有业务动作
+│   ├── types.ts                   与 Rust DTO 对齐的类型定义
 │   ├── lib/
-│   │   ├── api.ts                invoke 封装 + 事件订阅 + 错误归一化
-│   │   ├── ansi.ts               ANSI 转义解析器
-│   │   └── format.ts             状态/时间/时长/触发方式格式化
-│   ├── styles/main.css           深色主题设计系统
+│   │   ├── api.ts                 invoke 封装 + 事件订阅 + 错误归一化
+│   │   ├── ansi.ts                ANSI 转义解析器
+│   │   └── format.ts              状态/时间/时长/触发方式格式化
+│   ├── styles/main.css            深色主题设计系统
 │   └── components/
-│       ├── PipelineList.vue      流水线列表
-│       ├── RunList.vue           运行历史 + 触发运行弹窗
-│       ├── RunDetail.vue         阶段/任务拓扑 + 运行控制
-│       ├── JobLog.vue            实时日志面板
-│       ├── StatusBadge.vue       状态徽标
-│       └── SettingsPanel.vue     设置面板
-└── src-tauri/                    Rust 后端
+│       ├── PipelineList.vue       流水线树（含最近 3 次运行子项）
+│       ├── RunDetail.vue          阶段/任务拓扑 + 实时日志 + 触发运行弹窗
+│       ├── JobLog.vue             实时日志面板（增量、跟阶段、分级配色、平滑滚动）
+│       ├── StatusBadge.vue        状态徽标
+│       └── SettingsPanel.vue      设置面板（含开机自启）
+└── src-tauri/                     Rust 后端
     ├── Cargo.toml
     ├── tauri.conf.json
     ├── build.rs
-    ├── app-icon.png              图标源文件（已生成）
-    ├── icons/                    各平台图标（已生成，可直接打包）
+    ├── app-icon.png               图标源文件（已生成）
+    ├── icons/                     各平台图标（已生成，可直接打包）
     ├── capabilities/default.json
     └── src/
-        ├── main.rs               入口
-        ├── lib.rs                Builder 装配 / 窗口关闭行为 / 命令注册
-        ├── state.rs              AppState 全局共享状态
-        ├── config.rs             配置与令牌持久化（含脱敏、0600 权限）
-        ├── error.rs              统一错误类型（code + message 送前端）
-        ├── commands.rs           全部 Tauri command
-        ├── poller.rs             后台轮询 / 状态跃迁检测 / 事件推送 / 通知
-        ├── tray.rs               系统托盘与菜单
+        ├── main.rs                入口
+        ├── lib.rs                 Builder 装配 / 插件注册 / 命令注册
+        ├── state.rs               AppState 全局共享状态
+        ├── config.rs              配置与令牌持久化（含脱敏、0600 权限）
+        ├── error.rs               统一错误类型（code + message 送前端）
+        ├── commands.rs            全部 Tauri command（含开机自启）
+        ├── poller.rs              后台轮询 / 状态跃迁检测 / 事件推送 / 通知
+        ├── tray.rs                系统托盘与菜单
         └── api/
             ├── mod.rs
-            ├── client.rs         云效 OpenAPI 客户端
-            └── models.rs         宽容解析的数据模型
+            ├── client.rs          云效 OpenAPI 客户端
+            └── models.rs          宽容解析的数据模型
 ```
 
 ---
@@ -131,7 +154,7 @@ yunxiao-flow-monitor/
 
 ### 前置要求
 - **Node.js ≥ 20**
-- **Rust ≥ 1.77.2**（`rustup default stable`）
+- **Rust ≥ 1.90**（`rustup default stable`；`tauri-plugin-autostart` 要求）
 - **Windows**：Visual Studio 2022 生成工具（勾选「使用 C++ 的桌面开发」）+ WebView2 运行时（Win11 已内置）
 - **Linux**：`libwebkit2gtk-4.1-dev`、`build-essential`、`libssl-dev`、`libxdo-dev`、`libayatana-appindicator3-dev`、`librsvg2-dev`、`pkg-config`（`scripts/build-linux.sh` 会自动装）
 
@@ -215,6 +238,8 @@ chmod +x scripts/build-linux.sh
 | notifyOnSuccess / Fail / Canceled | true / true / false | 分状态桌面通知开关 |
 | minimizeToTrayOnClose | true | 关闭窗口时收进托盘 |
 
+> 「开机自启」保存在操作系统里（Windows 为注册表 Run 项），不属于 `config.json`，因此不占上表字段；设置面板打开时会实时读取当前状态。
+
 ### 令牌存储
 - **默认**：`credentials.bin`，XOR + Base64 混淆，文件权限 `0600`（Unix）。这是「避免明文落盘」，**不是加密**，请勿在共享机器上使用。
 - **推荐**：编译时加 `--features secure-store`，改存系统钥匙串（Windows 凭据管理器 / macOS Keychain / Linux Secret Service）。Linux 需先装 `libdbus-1-dev`；钥匙串不可用时会自动回落到混淆文件，不会导致功能失效。
@@ -228,18 +253,24 @@ chmod +x scripts/build-linux.sh
 
 **状态跃迁检测**：`AppState.last_status` 记录每条流水线「上次的 runId + status」。只有 runId 变了或 status 变了才算跃迁并通知。**首次轮询只写入基线、不发通知**，避免启动时被历史失败记录刷屏。
 
-**日志增量拉取**：`GetPipelineJobStepLog` 返回 `{ logs, last, more }`，`last` 是服务端的字符偏移量，下一轮用它作为 `offset`。由于服务端可能在半行处截断，追加时会把首个分片拼到上一行末尾，避免出现断裂的行。
+**日志增量拉取**：`GetPipelineJobStepLog` 的 `offset` 是**行号**。前端维护「已收到的行数」，每轮多回退一行重新拉取，用新内容覆盖可能还没写完的最后一行，避免出现半行或重复行；`limit` 传大值一次取回剩余行。任务结束后会补拉一次，把最后一行补全。
 
-**宽容解析**：云效不同接口的包装层不一致（有的直接返回数组，有的包在 `result` / `data` / `pipelines` 里；阶段信息有时平铺、有时嵌在 `stageInfo` 内）。`api/client.rs` 的 `extract_array` / `extract_object` 与 `api/models.rs` 的多键名回退负责统一兜住，字段缺失一律降级为 `None`，不会 panic。
+**日志自动跟阶段**：任务运行期间每 2 秒静默刷新步骤状态，优先跟随 `status=running` 的步骤；当前步骤结束后自动切到下一个未结束的步骤。手动在下拉框选步骤会暂停自动跟随，勾回「跟阶段」立即恢复。
+
+**开机自启**：接入官方 `tauri-plugin-autostart`，Windows 写入当前用户 Run 注册表项，Linux 写入 XDG autostart 桌面项，macOS 写入 LaunchAgent；无需管理员权限，也无需额外系统依赖。
+
+**宽容解析**：云效不同接口的包装层与实际返回不完全一致（数组 / 对象、`result` / `data` / `pipelines` 包装、阶段信息平铺或嵌在 `stageInfo` 内），`api/client.rs` 的 `extract_array` / `extract_object` 与 `api/models.rs` 的多键名回退负责统一兜住；字段缺失一律降级为 `None`，不会 panic。步骤与日志接口的具体差异见「二、返回结构兼容说明」。
 
 ---
 
 ## 八、已知边界
 
 1. **仅对接中心版**。Region 版（专有云）路径不含 `/organizations/{organizationId}`，需要另行适配。
-2. **未实现人工卡点审批与部署单查看**（本次范围为「只读 + 运行控制」）。`GetPipelineRun` 返回的 `jobs[].actions` 已经解析出来了，要扩展审批只需按 `action.type` 补对应的 PUT 接口。
+2. **未实现人工卡点审批与部署单查看**（当前范围为「只读 + 运行控制」）。`GetPipelineRun` 返回的 `jobs[].actions` 已经解析出来了，要扩展审批只需按 `action.type` 补对应的 PUT 接口。
 3. **限流**：轮询间隔下限已限制为 3 秒，但关注条数过多时仍可能撞上云效限流，界面上会显示 HTTP 429 提示，调大间隔即可。
-4. **验证状态**：前端已通过 `vite build` 与 `vue-tsc --noEmit` 全量类型检查；Rust 侧因交付环境无 Rust 工具链**未实际编译**，接口路径与参数均已逐一核对阿里云官方文档，但首次 `cargo build` 仍可能需要按编译器提示做少量调整。
+4. **运行历史只保留最近 3 次**：这是界面设计（避免侧栏过深），更早的记录需要到云效网页端查看。
+5. **开机自启的路径差异**：开发模式（`npm run app:dev`）下注册的是 `target/debug` 里的调试程序；安装版注册的是安装目录下的正式程序。切换前建议先在设置里关掉再重新开启。
+6. **验证状态**：前端已通过 `vue-tsc --noEmit` 全量类型检查与 `vite build`；Rust 侧已通过 `cargo check` 与 `cargo test`（含步骤/日志/提交解析的 4 个单元测试）。
 
 ---
 
@@ -255,6 +286,9 @@ npm run app:build        # tauri build（等价于打包）
 npm run icon:build       # 重新生成全套图标
 ./scripts/build-linux.sh
 .\scripts\build-windows.ps1
+
+# Rust 解析层单测（--no-default-features 可跳过生产构建对 dist/ 的依赖检查）
+cd src-tauri && cargo test --no-default-features --lib
 ```
 
 ---
